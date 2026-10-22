@@ -192,6 +192,19 @@ class App:
             return "Использование: /unwatch SYMBOL"
         return self.engine.unwatch(args[0]) if self.engine else "Движок ещё не запущен."
 
+    async def cmd_map(self, args: list[str]) -> str:
+        if len(args) != 3:
+            return ("Использование: /map SYMBOL CHAIN ADDRESS\n"
+                    "Пример: /map AGT solana J6WWvcNKKdm8wkoPUWwNuredaXxrPR34F5qJPesWfp3f")
+        return await self.engine.map_token(*args) if self.engine else "Движок ещё не запущен."
+
+    async def cmd_digest(self, args: list[str]) -> str:
+        if not args or args[0].lower() not in ("on", "off"):
+            return f"Дайджест сейчас {'включён' if self.digest_enabled else 'выключен'}. Использование: /digest on|off"
+        self.digest_enabled = args[0].lower() == "on"
+        await self.set_flag("digest", self.digest_enabled)
+        return "🧾 Часовой дайджест " + ("включён." if self.digest_enabled else "выключен.")
+
     async def cmd_export(self, args: list[str]) -> str | None:
         from .tracking.report import export_csv
         days = 7.0

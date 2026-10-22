@@ -15,14 +15,18 @@ from .bus import (DENSITY, EXHAUSTION, IMPULSE, LONG, PUSH, ROBOT, SHORT, SQUEEZ
 from .detectors.absorption import AbsorptionDetector
 from .detectors.density import DensityDetector
 from .detectors.impulse import ExhaustionDetector, ImpulseDetector
+from .detectors.push import PushDetector
 from .detectors.robot import RobotDetector
+from .detectors.squeeze import SqueezeDetector
 from .market.clock import clock
 from .market.tier1 import Tier1
 from .market.tier2 import Tier2Manager, Tier2State
-from .market.universe import Universe, normalize_symbol
+from .market.universe import Universe, futures_to_spot, normalize_symbol
 from .probes import SOURCES, mode_of, run_probes
 from .scoring import L_EXHAUSTION, L_IMPULSE, L_SETUP, L_STRONG, AlertDecision, AlertGate, Scorer
 from .sources.common import SourceError, make_session
+from .sources.dexscreener import DexScreener
+from .sources.mexc_spot_rest import MexcSpotRest, SpotSnapshot
 from .sources.mexc_futures_rest import MexcFuturesRest
 from .sources.mexc_futures_ws import MexcWs
 from .supervisor import backoff_delay
@@ -55,6 +59,9 @@ class Engine:
         self.t2_queue: DropQueue[MarketMsg] = DropQueue(20000, "tier2")
         self.t2_conns: list[MexcWs] = []
         self.detector_errors = 0
+        self.spot: MexcSpotRest | None = None
+        self.dex: DexScreener | None = None
+        self.squeeze = SqueezeDetector()
         self.scorer = Scorer(self.s)
         self.gate = AlertGate(self.s)
         self.tracker = Tracker(self.db)
@@ -87,6 +94,7 @@ class Engine:
         self.gate.load(await self.db.load_cooldowns(now), await self.db.recent_sent_alert_ts(now - 3_600_000))
         log.info("Восстановлено из БД", extra={"trackers": restored, "cooldowns": len(self.gate.cooldowns)})
 
+        await self.start_context_sources()
         ws_status = self.health.source("mexc_futures_ws", SOURCES["mexc_futures_ws"])
         self.ws_universe = MexcWs(self.session, "universe", self.queue, ws_status)
         await self.ws_universe.subscribe("sub.tickers", {})
@@ -549,7 +557,18 @@ class Engine:
         return st
 
     def on_promoted_hook(self, st: Tier2State) -> None:
-        """Точка расширения: спот, DexScreener, ликвидации (фазы 3–4)."""
+        if self.spot and self.spot.symbols:
+            spot_sym = futures_to_spot(st.symbol)
+            st.spot_symbol = spot_sym if spot_sym in self.spot.symbols else None
+        if st.spot_symbol:
+            st.det["push"] = PushDetector(self.s)
+        st.det["squeeze_next"] = 0
+        if self.dex:
+            asyncio.get_running_loop().create_task(self.refresh_dex(st))
+        self.on_promoted_extra(st)
+
+    def on_promoted_extra(self, st: Tier2State) -> None:
+        """Точка расширения (ликвидации Bybit)."""
 
     def _conn(self, idx: int) -> MexcWs:
         while len(self.t2_conns) <= idx:
@@ -683,8 +702,114 @@ class Engine:
         return events
 
     def eval_tier2_extra(self, st: Tier2State, now: int) -> list[DetectorEvent]:
-        """Точка расширения (толкание, сквиз)."""
-        return []
+        """Сквиз — раз в минуту на символ (толкание считается по приходу снимка спота)."""
+        if now < st.det.get("squeeze_next", 0):
+            return []
+        st.det["squeeze_next"] = now + 60_000
+        t1 = self.tier1.get(st.symbol)
+        if t1 is None or t1.hold_vol <= 0:
+            return []
+        spot_qv = self.spot.quote_volume.get(st.spot_symbol) if (self.spot and st.spot_symbol) else None
+        return self.squeeze.evaluate(t1, now, st.dex_metrics, spot_qv, self.liq_summary(st, now))
+
+    def liq_summary(self, st: Tier2State, now: int) -> dict | None:
+        return None
+
+    # ---------- контекстные источники: спот MEXC и DexScreener ----------
+    async def start_context_sources(self) -> None:
+        spot_st = self.health.source("mexc_spot", SOURCES["mexc_spot"])
+        if spot_st.enabled:
+            self.spot = MexcSpotRest(self.session, spot_st)
+            try:
+                n = await self.spot.load_exchange_info()
+                await self.spot.load_tickers_24h()
+                log.info("Спот MEXC загружен", extra={"usdt_pairs": n})
+            except SourceError as e:
+                log.warning("Спот MEXC недоступен", extra={"err": str(e)})
+            self.app.spawn("spot_meta", self.spot_meta_loop)
+            self.app.spawn("spot_depth", self.spot_depth_loop)
+        dex_st = self.health.source("dexscreener", SOURCES["dexscreener"])
+        if dex_st.enabled:
+            self.dex = DexScreener(self.session, self.db, dex_st)
+            self.app.spawn("dex_refresh", self.dex_refresh_loop)
+
+    async def spot_meta_loop(self) -> None:
+        assert self.spot
+        last_info = time.monotonic()
+        while True:
+            await asyncio.sleep(60)
+            try:
+                await self.spot.load_tickers_24h()
+                if time.monotonic() - last_info > 6 * 3600:
+                    await self.spot.load_exchange_info()
+                    last_info = time.monotonic()
+            except SourceError as e:
+                log.warning("Спот: ошибка обновления", extra={"err": str(e)})
+
+    async def spot_depth_loop(self) -> None:
+        """Стакан спота раз в 2 с для символов tier 2, у которых есть спот-рынок."""
+        assert self.spot
+        while True:
+            t0 = time.monotonic()
+            todo = [st for st in self.tier2.states.values() if st.spot_symbol]
+            if todo:
+                res = await asyncio.gather(*(self.spot.depth(st.spot_symbol, 50) for st in todo),
+                                           return_exceptions=True)
+                now = clock.now()
+                for st, r in zip(todo, res):
+                    if isinstance(r, Exception) or st.symbol not in self.tier2:
+                        continue
+                    try:
+                        snap = SpotSnapshot(int(r.get("timestamp") or now), r.get("bids") or [], r.get("asks") or [])
+                        st.spot_book_snapshots.append(snap)
+                        push: PushDetector | None = st.det.get("push")
+                        t1 = self.tier1.get(st.symbol)
+                        if push:
+                            for ev in push.on_snapshot(st.symbol, snap, t1.price_ring if t1 else None):
+                                self.handle_event(ev)
+                    except Exception:
+                        self.detector_errors += 1
+                        log.exception("Ошибка детектора толкания", extra={"symbol": st.symbol})
+            await asyncio.sleep(max(0.2, 2.0 - (time.monotonic() - t0)))
+
+    async def refresh_dex(self, st: Tier2State, force: bool = False) -> dict | None:
+        if not self.dex:
+            return None
+        t1 = self.tier1.get(st.symbol)
+        try:
+            m = await self.dex.metrics(st.symbol, st.spec.base, t1.last_price if t1 else 0.0, force=force)
+        except Exception:
+            log.exception("DexScreener: сбой", extra={"symbol": st.symbol})
+            return None
+        st.dex_metrics = m
+        st.det["dex_at"] = time.monotonic()
+        return m
+
+    async def dex_refresh_loop(self) -> None:
+        while True:
+            await asyncio.sleep(30)
+            for st in list(self.tier2.states.values()):
+                if time.monotonic() - st.det.get("dex_at", 0) > 300:
+                    await self.refresh_dex(st)
+
+    async def map_token(self, raw_symbol: str, chain_id: str, address: str) -> str:
+        if not self.dex:
+            return "DexScreener отключён или недоступен."
+        sym = normalize_symbol(raw_symbol)
+        if sym not in self.universe:
+            return f"Контракт {fmt.e(sym)} не найден."
+        try:
+            m = await self.dex.set_manual(sym, chain_id.strip().lower(), address.strip())
+        except SourceError as e:
+            return f"DexScreener ошибка: {fmt.e(str(e))}"
+        if not m:
+            return "DexScreener не нашёл пар для этого адреса. Проверьте chainId (solana, ethereum, bsc, base…) и адрес."
+        st = self.tier2.get(sym)
+        if st:
+            st.dex_metrics = m
+        return (f"✅ {fmt.e(sym)} → {fmt.e(m['chain_id'])}:{fmt.e(m['address'])}\n"
+                f"Цена DEX ${m['price_usd']} · ликвидность {fmt.money(m['liquidity_usd'])} · "
+                f"{'капа' if m.get('mcap_source') == 'mcap' else 'FDV'} {fmt.money(m.get('mcap'))}")
 
     def liq_usd(self, st: Tier2State, now: int) -> float | None:
         return None
@@ -739,4 +864,9 @@ class Engine:
         lines.append(f"Tier 2: {len(self.tier2)}/{self.tier2.capacity} · WS-соединений {len(self.t2_conns)} · "
                      f"сообщений {t2_msgs} · потеряно {self.t2_queue.dropped} · ошибок детекторов {self.detector_errors}")
         lines.extend(self.tier2.describe(clock.now()))
+        if self.spot:
+            lines.append(f"Спот MEXC: пар USDT {len(self.spot.symbols)}, запросов {self.spot.requests}, "
+                         f"ошибок {self.spot.errors}")
+        if self.dex:
+            lines.append(f"DexScreener: запросов {self.dex.requests}, ошибок {self.dex.errors}")
         return lines

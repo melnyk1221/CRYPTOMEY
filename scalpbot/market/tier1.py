@@ -15,7 +15,7 @@ EWMA_HALFLIFE = 1800  # 60 мин в 2-секундных отсчётах
 
 class SymbolState:
     __slots__ = ("symbol", "last_price", "bid1", "ask1", "amount24", "hold_vol", "funding_rate",
-                 "funding_cycle_h", "contract_size", "price_unit", "price_ring", "oi_ring", "spread_ring",
+                 "funding_cycle_h", "contract_size", "price_unit", "price_ring", "oi_ring", "spread_ring", "slow_ring",
                  "ret_ewma", "first_ts", "last_ts", "cooldowns", "rest_ts", "fair_price")
 
     def __init__(self, symbol: str, contract_size: float, price_unit: float):
@@ -33,6 +33,7 @@ class SymbolState:
         self.price_ring = Ring(PRICE_RING)
         self.oi_ring = Ring(OI_RING)
         self.spread_ring = Ring(SPREAD_RING)
+        self.slow_ring = Ring(OI_RING)  # цена раз в 15 с (~100 мин) — для изменений за 60 мин
         self.ret_ewma = Ewma(EWMA_HALFLIFE)
         self.first_ts = 0
         self.last_ts = 0
@@ -71,6 +72,15 @@ class SymbolState:
     def pct_change(self, window_s: float) -> float | None:
         r = self.log_return(window_s)
         return None if r is None else (math.exp(r) - 1.0) * 100.0
+
+    def pct_change_slow(self, window_s: float) -> float | None:
+        last = self.slow_ring.last()
+        if last is None:
+            return None
+        then = self.slow_ring.value_at(last[0] - int(window_s * 1000))
+        if not then or then <= 0:
+            return None
+        return (last[1] / then - 1.0) * 100.0
 
     def oi_change_pct(self, window_s: float) -> float | None:
         last = self.oi_ring.last()
@@ -171,6 +181,8 @@ class Tier1:
                 st.last_price = float(it["lastPrice"])
             t = int(it.get("timestamp") or ts)
             st.rest_ts = t
+            if st.last_price > 0:
+                st.slow_ring.append(t, st.last_price)
             if st.hold_vol > 0 and st.last_price > 0:
                 st.oi_ring.append(t, st.oi_usd)
             sp = st.spread_pct
@@ -191,4 +203,5 @@ class Tier1:
         return out[:n]
 
     def memory_bytes(self) -> int:
-        return sum(s.price_ring.nbytes() + s.oi_ring.nbytes() + s.spread_ring.nbytes() for s in self.states.values())
+        return sum(s.price_ring.nbytes() + s.oi_ring.nbytes() + s.spread_ring.nbytes() + s.slow_ring.nbytes()
+                   for s in self.states.values())
