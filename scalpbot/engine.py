@@ -22,10 +22,12 @@ from .market.clock import clock
 from .market.tier1 import Tier1
 from .market.tier2 import Tier2Manager, Tier2State
 from .market.universe import Universe, futures_to_spot, normalize_symbol
-from .probes import SOURCES, mode_of, run_probes
+from .probes import SOURCES, decide_enabled, mode_of, run_probes
 from .scoring import L_EXHAUSTION, L_IMPULSE, L_SETUP, L_STRONG, AlertDecision, AlertGate, Scorer
+from .sources.bybit_liq import BybitLiquidations, Liquidation, liq_window
 from .sources.common import SourceError, make_session
 from .sources.dexscreener import DexScreener
+from .sources.hyperliquid import Hyperliquid
 from .sources.mexc_spot_rest import MexcSpotRest, SpotSnapshot
 from .sources.mexc_futures_rest import MexcFuturesRest
 from .sources.mexc_futures_ws import MexcWs
@@ -62,6 +64,8 @@ class Engine:
         self.spot: MexcSpotRest | None = None
         self.dex: DexScreener | None = None
         self.squeeze = SqueezeDetector()
+        self.bybit: BybitLiquidations | None = None
+        self.hl: Hyperliquid | None = None
         self.scorer = Scorer(self.s)
         self.gate = AlertGate(self.s)
         self.tracker = Tracker(self.db)
@@ -129,9 +133,7 @@ class Engine:
                 st.latency_ms = r.latency_ms
                 st.error = r.error
                 # auto + недоступен → отключаем. Binance в v1 только проверяется.
-                st.enabled = r.state == "ok" or (mode == "on" and r.state != "disabled")
-                if r.state == "disabled":
-                    st.enabled = False
+                st.enabled = decide_enabled(mode, r.state)
             log.info("Проверка источников", extra={"probes": {k: (v.state, v.latency_ms, v.http_status, v.error)
                                                                for k, v in res.items()}})
             core_ok = res["mexc_futures"].state == "ok"
@@ -568,7 +570,8 @@ class Engine:
         self.on_promoted_extra(st)
 
     def on_promoted_extra(self, st: Tier2State) -> None:
-        """Точка расширения (ликвидации Bybit)."""
+        if self.bybit:
+            asyncio.get_running_loop().create_task(self.bybit.subscribe(st.symbol))
 
     def _conn(self, idx: int) -> MexcWs:
         while len(self.t2_conns) <= idx:
@@ -609,7 +612,8 @@ class Engine:
         self.on_demoted_hook(symbol)
 
     def on_demoted_hook(self, symbol: str) -> None:
-        """Точка расширения (фазы 3–4)."""
+        if self.bybit:
+            asyncio.get_running_loop().create_task(self.bybit.unsubscribe(symbol))
 
     async def t2_process_loop(self) -> None:
         q = self.t2_queue
@@ -710,10 +714,18 @@ class Engine:
         if t1 is None or t1.hold_vol <= 0:
             return []
         spot_qv = self.spot.quote_volume.get(st.spot_symbol) if (self.spot and st.spot_symbol) else None
-        return self.squeeze.evaluate(t1, now, st.dex_metrics, spot_qv, self.liq_summary(st, now))
+        evs = self.squeeze.evaluate(t1, now, st.dex_metrics, spot_qv, self.liq_summary(st, now))
+        hl = self.hl.get(st.spec.base) if self.hl else None
+        for ev in evs:
+            if hl:   # Hyperliquid — отдельно, как контекст (не участвует в условиях)
+                ev.details["hl_oi_usd"] = round(hl["oi_usd"], 2)
+                ev.details["hl_funding_pct_1h"] = round(hl["funding_pct_1h"], 5)
+        return evs
 
     def liq_summary(self, st: Tier2State, now: int) -> dict | None:
-        return None
+        if not self.bybit or not self.bybit.has(st.symbol):
+            return None
+        return liq_window(st.liq_ring, now)
 
     # ---------- контекстные источники: спот MEXC и DexScreener ----------
     async def start_context_sources(self) -> None:
@@ -732,6 +744,33 @@ class Engine:
         if dex_st.enabled:
             self.dex = DexScreener(self.session, self.db, dex_st)
             self.app.spawn("dex_refresh", self.dex_refresh_loop)
+        await self.start_optional_venues()
+
+    async def start_optional_venues(self) -> None:
+        """Bybit (ликвидации) и Hyperliquid (OI/funding) — по флагам auto|on|off и результатам проверки."""
+        by_st = self.health.source("bybit", SOURCES["bybit"])
+        if by_st.enabled:
+            self.bybit = BybitLiquidations(self.session, by_st, self.on_liquidation)
+            try:
+                n = await self.bybit.load_instruments()
+                log.info("Bybit: инструменты загружены", extra={"linear_usdt": n})
+                self.app.spawn("bybit_liq", self.bybit.run)
+            except SourceError as e:
+                log.warning("Bybit недоступен — ликвидации отключены", extra={"err": str(e)})
+                by_st.enabled = False
+                by_st.state = "blocked" if e.blocked else "error"
+                by_st.http_status = e.status
+                self.bybit = None
+        hl_st = self.health.source("hyperliquid", SOURCES["hyperliquid"])
+        if hl_st.enabled:
+            self.hl = Hyperliquid(self.session, hl_st)
+            self.app.spawn("hyperliquid", self.hl.run)
+
+    def on_liquidation(self, liq: Liquidation) -> None:
+        for st in self.tier2.states.values():
+            if st.symbol.replace("_", "") == liq.symbol:
+                st.liq_ring.append(liq)
+                return
 
     async def spot_meta_loop(self) -> None:
         assert self.spot
@@ -812,7 +851,11 @@ class Engine:
                 f"{'капа' if m.get('mcap_source') == 'mcap' else 'FDV'} {fmt.money(m.get('mcap'))}")
 
     def liq_usd(self, st: Tier2State, now: int) -> float | None:
-        return None
+        """Сумма ликвидаций Bybit за 15 мин (для затухания), None — данных нет."""
+        if not self.bybit or not st.liq_ring:
+            return None
+        w = liq_window(st.liq_ring, now)
+        return w["long_usd"] + w["short_usd"]
 
     def watch(self, raw: str) -> str:
         sym = normalize_symbol(raw)
@@ -869,4 +912,11 @@ class Engine:
                          f"ошибок {self.spot.errors}")
         if self.dex:
             lines.append(f"DexScreener: запросов {self.dex.requests}, ошибок {self.dex.errors}")
+        if self.bybit:
+            lines.append(f"Bybit ликвидации: топиков {len(self.bybit.topics)}, получено {self.bybit.received}")
+        if self.hl:
+            lines.append(f"Hyperliquid: активов {len(self.hl.assets)}")
+        b = self.health.sources.get("binance")
+        if b:
+            lines.append(f"Binance (только проверка в v1): {b.short()}")
         return lines

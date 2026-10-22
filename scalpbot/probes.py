@@ -9,6 +9,7 @@ import aiohttp
 import orjson
 
 from .config import Settings
+from .sources import binance_probe
 from .sources.common import SourceError, request_json
 from .sources.mexc_futures_ws import WS_URL
 
@@ -35,6 +36,15 @@ class ProbeResult:
     error: str = ""
 
 
+def decide_enabled(mode: str, state: str) -> bool:
+    """auto: включён, только если проверка прошла; on: включён всегда (кроме off); off: выключен."""
+    if mode == "off" or state == "disabled":
+        return False
+    if mode == "on":
+        return True
+    return state == "ok"
+
+
 def mode_of(settings: Settings, name: str) -> str:
     return {"bybit": settings.ENABLE_BYBIT, "hyperliquid": settings.ENABLE_HYPERLIQUID,
             "binance": settings.ENABLE_BINANCE}.get(name, "on")
@@ -46,6 +56,13 @@ async def _http(session: aiohttp.ClientSession, name: str, method: str, url: str
         return ProbeResult(name, "ok", round(lat))
     except SourceError as e:
         return ProbeResult(name, "blocked" if e.blocked else "error", None, e.status, str(e)[:120])
+
+
+async def _binance(session: aiohttp.ClientSession) -> ProbeResult:
+    t0 = time.monotonic()
+    state, status, err = await binance_probe.probe(session)
+    lat = round((time.monotonic() - t0) * 1000) if state == "ok" else None
+    return ProbeResult("binance", state, lat, None if state == "ok" else status, err)
 
 
 async def _ws(session: aiohttp.ClientSession) -> ProbeResult:
@@ -74,7 +91,7 @@ async def run_probes(session: aiohttp.ClientSession, settings: Settings) -> dict
         "dexscreener": _http(session, "dexscreener", "GET", "https://api.dexscreener.com/latest/dex/search?q=BTC"),
         "bybit": _http(session, "bybit", "GET", "https://api.bybit.com/v5/market/time"),
         "hyperliquid": _http(session, "hyperliquid", "POST", "https://api.hyperliquid.xyz/info", {"type": "meta"}),
-        "binance": _http(session, "binance", "GET", "https://fapi.binance.com/fapi/v1/ping"),
+        "binance": _binance(session),
     }
     out: dict[str, ProbeResult] = {}
     names = []

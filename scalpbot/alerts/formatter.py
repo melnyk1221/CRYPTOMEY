@@ -146,6 +146,10 @@ def event_line(ev: DetectorEvent, fp: Callable[[float | None], str]) -> str:
         if d.get("fut_spot_ratio") is not None:
             parts.append(f"фьюч/спот ≈{d['fut_spot_ratio']:.1f}×")
         parts.append(f"funding {funding_str(d.get('funding_pct'), d.get('funding_cycle_h'))}")
+        if d.get("short_liq_usd_15m"):
+            parts.append(f"ликв. шортов 15м {money(d['short_liq_usd_15m'])}")
+        if d.get("hl_oi_usd"):
+            parts.append(f"HL OI {money(d['hl_oi_usd'])}")
         return f"{ok} Сквиз: " + " · ".join(parts)
     if ev.family == IMPULSE:
         return f"⚪ Импульс {pct(d.get('move_pct'))} за {e(str(d.get('window')))}"

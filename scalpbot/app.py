@@ -156,7 +156,10 @@ class App:
             f"Алерты: {'⏸ на паузе' if self.paused else 'включены'} · дайджест {'вкл' if self.digest_enabled else 'выкл'}",
         ]
         if h.sources:
-            lines.append("Источники: " + ", ".join(st.short() for st in h.sources.values()))
+            from .probes import SOURCES
+            order = {name: i for i, name in enumerate(SOURCES)}
+            srcs = sorted(h.sources.values(), key=lambda st: order.get(st.name, 99))
+            lines.append("Источники: " + ", ".join(st.short() for st in srcs))
         lines.extend(self.status_extra())
         if self.sender:
             lines.append(f"Telegram: отправлено {self.sender.sent}, ошибок {self.sender.failed}, "
