@@ -115,7 +115,15 @@ class Engine:
         sp("process_tier2", self.t2_process_loop)
         sp("book_sync", self.book_sync_loop)
         sp("tier2_eval", self.tier2_eval_loop)
+        sp("memory_watchdog", self.memory_watchdog_loop)
+        self.s.on_change(self._on_setting_changed)
         self.started = True
+
+    def _on_setting_changed(self, name: str, value) -> None:
+        if name == "COST_ROUND_TRIP_PCT":
+            self.history.invalidate()
+        if name == "TIER2_MAX":
+            self.tier2.max_override = None
 
     async def stop(self) -> None:
         if self.session:
@@ -313,7 +321,7 @@ class Engine:
         if reason == "cooldown":
             return
         until = self.gate.set_cooldown(dec, now)
-        asyncio.get_running_loop().create_task(self._save_cooldown(dec, until))
+        self.app.bg(self._save_cooldown(dec, until))
         send = True
         why = None
         if self.gate.over_cap(now):
@@ -342,7 +350,7 @@ class Engine:
         log.info("Алерт", extra={"symbol": dec.symbol, "level": dec.level, "direction": dec.direction,
                                  "send": send, "reason": why})
         if send:
-            asyncio.get_running_loop().create_task(self._send_alert(eid, dec))
+            self.app.bg(self._send_alert(eid, dec))
 
     async def _save_cooldown(self, dec: AlertDecision, until: int) -> None:
         try:
@@ -566,12 +574,12 @@ class Engine:
             st.det["push"] = PushDetector(self.s)
         st.det["squeeze_next"] = 0
         if self.dex:
-            asyncio.get_running_loop().create_task(self.refresh_dex(st))
+            self.app.bg(self.refresh_dex(st))
         self.on_promoted_extra(st)
 
     def on_promoted_extra(self, st: Tier2State) -> None:
         if self.bybit:
-            asyncio.get_running_loop().create_task(self.bybit.subscribe(st.symbol))
+            self.app.bg(self.bybit.subscribe(st.symbol))
 
     def _conn(self, idx: int) -> MexcWs:
         while len(self.t2_conns) <= idx:
@@ -595,7 +603,7 @@ class Engine:
         async def go() -> None:
             await ws.subscribe("sub.deal", {"symbol": symbol, "compress": False})
             await ws.subscribe("sub.depth", {"symbol": symbol})
-        asyncio.get_running_loop().create_task(go())
+        self.app.bg(go())
 
     def _t2_unsubscribe(self, idx: int, symbol: str) -> None:
         if not (0 <= idx < len(self.t2_conns)):
@@ -605,7 +613,7 @@ class Engine:
         async def go() -> None:
             await ws.unsubscribe("sub.deal", {"symbol": symbol})
             await ws.unsubscribe("sub.depth", {"symbol": symbol})
-        asyncio.get_running_loop().create_task(go())
+        self.app.bg(go())
 
     def _t2_demoted(self, symbol: str) -> None:
         self.exhaustion.forget(symbol)
@@ -613,7 +621,7 @@ class Engine:
 
     def on_demoted_hook(self, symbol: str) -> None:
         if self.bybit:
-            asyncio.get_running_loop().create_task(self.bybit.unsubscribe(symbol))
+            self.app.bg(self.bybit.unsubscribe(symbol))
 
     async def t2_process_loop(self) -> None:
         q = self.t2_queue
@@ -874,6 +882,51 @@ class Engine:
         self.tier2.demote(sym, clock.now(), why="/unwatch")
         return f"{fmt.e(sym)} снят с детального наблюдения."
 
+    async def memory_watchdog_loop(self) -> None:
+        while True:
+            await asyncio.sleep(30)
+            self.memory_step(self.health.sample_rss(), time.monotonic())
+
+    _mem_last_warn = -1e9
+    _mem_calm_since: float | None = None
+
+    def memory_step(self, rss: float, mono: float) -> str:
+        """RSS > 80% лимита → TIER2_MAX −3 (мин. 5), понизить простаивающих, gc;
+        RSS > 95% → понизить всех неручных. Предупреждение в Telegram не чаще раза в час."""
+        import gc
+        limit = float(self.s.MEMORY_LIMIT_MB)
+        now = clock.now()
+        if rss > 0.95 * limit:
+            demoted = self.tier2.demote_all_auto(now)
+            self.tier2.max_override = 5
+            gc.collect()
+            self._mem_calm_since = None
+            if mono - self._mem_last_warn > 3600:
+                self._mem_last_warn = mono
+                self.app.notify(f"🧯 Память {rss:.0f} МБ (> 95% от {limit:.0f}). Из tier 2 убраны все "
+                                f"автоматические символы ({len(demoted)}), лимит tier 2 = 5.")
+            return "critical"
+        if rss > 0.8 * limit:
+            self.tier2.max_override = max(5, self.tier2.capacity - 3)
+            self.tier2.demote_idle(now)
+            gc.collect()
+            self._mem_calm_since = None
+            if mono - self._mem_last_warn > 3600:
+                self._mem_last_warn = mono
+                self.app.notify(f"⚠️ Память {rss:.0f} МБ (> 80% от {limit:.0f}). Лимит tier 2 снижен до "
+                                f"{self.tier2.capacity}.")
+            return "high"
+        if self.tier2.max_override is not None and rss < 0.6 * limit:
+            self._mem_calm_since = self._mem_calm_since or mono
+            if mono - self._mem_calm_since > 600:   # 10 минут спокойно — понемногу возвращаем ёмкость
+                nxt = self.tier2.max_override + 3
+                self.tier2.max_override = None if nxt >= self.s.TIER2_MAX else nxt
+                self._mem_calm_since = mono
+                return "relaxed"
+            return "calm"
+        self._mem_calm_since = None
+        return "ok"
+
     # ======================================================================
     # Для команд
     # ======================================================================
@@ -890,13 +943,15 @@ class Engine:
 
     def status_lines(self) -> list[str]:
         ws = self.ws_universe
+        up = max(1.0, self.health.uptime_s())
+        total_msgs = (ws.messages if ws else 0) + sum(c.messages for c in self.t2_conns)
         warm = sum(1 for s in self.tier1.states.values() if s.warm_minutes() >= self.s.IMPULSE_WARMUP_MIN)
         eligible = len(self.tier1.eligible(self.s.MIN_TURNOVER_24H_USD))
         lines = [
             f"Tier 1: {len(self.tier1.states)} контрактов (под алерты: {eligible}, прогреты: {warm})",
             f"WS тикеры: {'подключён' if ws and ws.connected else 'НЕТ'}, кадров {self.tier1.frames}, "
             f"переподключений {max(0, (ws.connects if ws else 0) - 1)}",
-            f"Очередь: потеряно событий {self.queue.dropped}",
+            f"WS сообщений/с (среднее): {total_msgs / up:.1f} · потеряно событий {self.queue.dropped}",
             f"События: {self.events_total}, алерты: {self.alerts_total}, отправлено за час: "
             f"{self.gate.sent_last_hour(clock.now())}/{self.s.MAX_ALERTS_PER_HOUR}",
             f"Открытых трекеров исходов: {self.tracker.count}",

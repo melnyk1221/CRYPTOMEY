@@ -36,6 +36,7 @@ class App:
         self.paused = False
         self.digest_enabled = True
         self._tasks: list[asyncio.Task] = []
+        self._bg: set[asyncio.Task] = set()
         self._stop = asyncio.Event()
 
     # ---------- задачи ----------
@@ -44,6 +45,18 @@ class App:
         t = asyncio.create_task(coro, name=name)
         self._tasks.append(t)
         return t
+
+    def bg(self, coro) -> asyncio.Task:
+        """Короткая фоновая задача; ссылка хранится, чтобы её не собрал GC."""
+        t = asyncio.create_task(coro)
+        self._bg.add(t)
+        t.add_done_callback(self._bg_done)
+        return t
+
+    def _bg_done(self, t: asyncio.Task) -> None:
+        self._bg.discard(t)
+        if not t.cancelled() and t.exception() is not None:
+            log.error("Фоновая задача упала", exc_info=t.exception())
 
     def request_stop(self) -> None:
         self._stop.set()
@@ -152,7 +165,8 @@ class App:
             f"Аптайм: {fmt_uptime(h.uptime_s())}",
             f"Память: {rss:.0f} / {h.memory_limit_mb} МБ (пик {h.rss_peak_mb:.0f})",
             f"Лаг event loop p95: {h.lag_p95_ms():.0f} мс",
-            f"БД: {self.db.size_mb():.1f} МБ" + ("" if self.db.writable else " ⚠️ НЕ на томе"),
+            f"БД: {self.db.size_mb():.1f} МБ" + ("" if self.db.writable else " ⚠️ НЕ на томе")
+            + (" ⚠️ > 300 МБ (том 0.5 ГБ) — сделайте /export" if self.db.size_mb() > 300 else ""),
             f"Алерты: {'⏸ на паузе' if self.paused else 'включены'} · дайджест {'вкл' if self.digest_enabled else 'выкл'}",
         ]
         if h.sources:
@@ -184,6 +198,23 @@ class App:
 
     async def cmd_top(self, args: list[str]) -> str:
         return self.engine.top_text() if self.engine else "Движок ещё не запущен."
+
+    async def cmd_set(self, args: list[str]) -> str:
+        import html as _html
+
+        from .config import TUNABLES, ConfigError
+        if len(args) != 2:
+            keys = ", ".join(TUNABLES)
+            return "Использование: /set KEY VALUE\nДоступные ключи: " + _html.escape(keys)
+        try:
+            old, new = self.settings.set_runtime(args[0], args[1])
+        except ConfigError as e:
+            return f"⚠️ {_html.escape(str(e))}"
+        key = args[0].strip().upper()
+        await self.db.save_setting(f"set:{key}", new)
+        t = TUNABLES[key]
+        return (f"✅ {key}: {old} → {new}\n<i>{_html.escape(t.desc)}; диапазон [{t.min:g}, {t.max:g}]</i>\n"
+                f"Сохранено и переживёт перезапуск.")
 
     async def cmd_watch(self, args: list[str]) -> str:
         if not args:
