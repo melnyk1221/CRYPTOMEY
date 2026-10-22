@@ -32,6 +32,7 @@ class App:
         self.bot = None
         self.dp = None
         self.sender: TelegramSender | None = None
+        self.engine = None
         self.paused = False
         self.digest_enabled = True
         self._tasks: list[asyncio.Task] = []
@@ -86,8 +87,9 @@ class App:
         await self.on_start()
 
     async def on_start(self) -> None:
-        """Точка расширения для источников рынка (фазы 1+)."""
-        self.notify("Бот запущен.")
+        from .engine import Engine
+        self.engine = Engine(self)
+        await self.engine.start()
 
     async def _polling(self) -> None:
         assert self.dp and self.bot
@@ -114,13 +116,13 @@ class App:
     async def shutdown(self) -> None:
         log.info("Остановка…")
         t0 = time.monotonic()
-        await self.on_shutdown()
-        if self.sender and not self._stop_message_sent:
-            self._stop_message_sent = True
-            await self.sender.send_now("🛑 Бот остановлен (redeploy или остановка сервиса).", timeout=3.0)
         for t in self._tasks:
             t.cancel()
         await asyncio.gather(*self._tasks, return_exceptions=True)
+        if self.sender and not self._stop_message_sent:
+            self._stop_message_sent = True
+            await self.sender.send_now("🛑 Бот остановлен (redeploy или остановка сервиса).", timeout=3.0)
+        await self.on_shutdown()
         try:
             await asyncio.wait_for(self.db.close(), timeout=max(0.5, 5.0 - (time.monotonic() - t0)))
         except Exception:
@@ -135,7 +137,11 @@ class App:
     _stop_message_sent = False
 
     async def on_shutdown(self) -> None:
-        """Точка расширения: закрыть WS, сбросить состояния."""
+        if self.engine:
+            try:
+                await asyncio.wait_for(self.engine.stop(), 2.0)
+            except Exception:
+                log.exception("Ошибка остановки движка")
 
     # ---------- /status ----------
     def status_text(self) -> str:
@@ -159,7 +165,35 @@ class App:
         return "\n".join(lines)
 
     def status_extra(self) -> list[str]:
-        return []
+        return self.engine.status_lines() if self.engine else []
+
+    # ---------- команды (делегаты из bot/handlers.py) ----------
+    async def cmd_stats(self, args: list[str]) -> str:
+        from .tracking.report import compute_stats, format_stats
+        days, flt = 7.0, None
+        for a in args:
+            try:
+                days = max(0.04, min(60.0, float(a.replace(",", "."))))
+            except ValueError:
+                flt = a.upper()
+        cost = self.settings.COST_ROUND_TRIP_PCT
+        return format_stats(await compute_stats(self.db, days, cost, flt), days, cost)
+
+    async def cmd_top(self, args: list[str]) -> str:
+        return self.engine.top_text() if self.engine else "Движок ещё не запущен."
+
+    async def cmd_export(self, args: list[str]) -> str | None:
+        from .tracking.report import export_csv
+        days = 7.0
+        if args:
+            try:
+                days = max(0.04, min(60.0, float(args[0])))
+            except ValueError:
+                return "Использование: /export [дни]"
+        data, n = await export_csv(self.db, days)
+        assert self.sender
+        self.sender.send_document(data, f"scalpbot_export_{days:g}d.csv", caption=f"Алерты и события за {days:g} дн.: {n} строк")
+        return None
 
     # ---------- флаги ----------
     async def set_flag(self, name: str, value: bool) -> None:

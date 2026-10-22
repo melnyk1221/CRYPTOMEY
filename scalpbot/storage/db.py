@@ -42,6 +42,7 @@ MIGRATIONS: list[str] = [
         event_id INTEGER PRIMARY KEY,
         symbol TEXT NOT NULL,
         direction TEXT NOT NULL,
+        move_sign INTEGER NOT NULL DEFAULT 0, -- для нейтральных импульсов: +1 памп, −1 дамп
         ts0 INTEGER NOT NULL,
         ref_price REAL NOT NULL,
         done INTEGER NOT NULL DEFAULT 0,
@@ -149,8 +150,9 @@ class Database:
         # Применяется после вставки событий в том же flush, поэтому порядок корректен.
         self._sent_buf.append((int(sent), event_id))
 
-    def add_outcome(self, *, event_id: int, symbol: str, direction: str, ts0: int, ref_price: float) -> None:
-        self._outcome_new.append((event_id, symbol, direction, ts0, ref_price, ref_price, ref_price))
+    def add_outcome(self, *, event_id: int, symbol: str, direction: str, ts0: int, ref_price: float,
+                    move_sign: int = 0) -> None:
+        self._outcome_new.append((event_id, symbol, direction, move_sign, ts0, ref_price, ref_price, ref_price))
 
     def update_outcome(self, event_id: int, **cols: Any) -> None:
         self._outcome_upd.setdefault(event_id, {}).update(cols)
@@ -176,8 +178,8 @@ class Database:
                         " ref_price, spread_pct, details, sent) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)", ev)
                 if on:
                     await self.conn.executemany(
-                        "INSERT OR IGNORE INTO outcomes(event_id, symbol, direction, ts0, ref_price, run_max, run_min)"
-                        " VALUES (?,?,?,?,?,?,?)", on)
+                        "INSERT OR IGNORE INTO outcomes(event_id, symbol, direction, move_sign, ts0, ref_price, run_max,"
+                        " run_min) VALUES (?,?,?,?,?,?,?,?)", on)
                 for eid, cols in up.items():
                     keys = list(cols)
                     await self.conn.execute(

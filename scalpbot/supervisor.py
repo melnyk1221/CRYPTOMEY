@@ -29,7 +29,10 @@ async def supervise(name: str, factory: Callable[[], Awaitable[None]],
         except asyncio.CancelledError:
             raise
         except Exception as e:  # noqa: BLE001 — супервизор ловит всё
-            log.exception("Задача упала", extra={"task": name})
+            if getattr(e, "expected", False):
+                log.warning("Задача завершилась: %s", e, extra={"task": name})
+            else:
+                log.exception("Задача упала", extra={"task": name})
             if on_error:
                 try:
                     on_error(name, e)
