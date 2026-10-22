@@ -8,7 +8,7 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass
 
-from ..bus import IMPULSE, NEUTRAL, DetectorEvent
+from ..bus import EXHAUSTION, IMPULSE, LONG, NEUTRAL, SHORT, DetectorEvent
 from ..config import Settings
 from ..market.tier1 import SymbolState, Tier1
 
@@ -108,3 +108,119 @@ class ImpulseDetector:
 
 def _r(x: float | None, nd: int = 2) -> float | None:
     return None if x is None else round(x, nd)
+
+
+# ======================================================================
+# A2. Затухание после импульса (tier 2)
+# ======================================================================
+ARM_MS = 30 * 60_000
+MIN_DELAY_MS = 2 * 60_000
+MIN_DELTA_TOTAL_USD = 1_000.0
+
+
+class _Arm:
+    __slots__ = ("ts", "sign", "move_pct", "start_price", "extreme", "peak_r60", "oi_start", "spread_med",
+                 "fired", "tag")
+
+    def __init__(self, ts: int, sign: int, move_pct: float, start_price: float, peak_r60: float,
+                 oi_start: float | None, spread_med: float | None):
+        self.ts = ts
+        self.sign = sign
+        self.move_pct = move_pct
+        self.start_price = start_price
+        self.extreme = start_price * math.exp(math.log1p(move_pct / 100.0))
+        self.peak_r60 = peak_r60
+        self.oi_start = oi_start
+        self.spread_med = spread_med
+        self.fired = False
+        self.tag = "pump" if sign > 0 else "dump"
+
+
+class ExhaustionDetector:
+    """Взводится на 30 мин после каждого события IMPULSE; срабатывает один раз на импульс."""
+
+    def __init__(self, settings: Settings):
+        self.s = settings
+        self.arms: dict[str, _Arm] = {}
+
+    def arm(self, ev: DetectorEvent, st: SymbolState) -> None:
+        d = ev.details
+        sign = int(d.get("move_sign", 1))
+        win = int(d.get("window_s", 60))
+        start_price = st.price_ring.value_at(ev.ts - win * 1000) or st.last_price
+        r60 = st.log_return(60, ev.ts)
+        prev = self.arms.get(ev.symbol)
+        if prev and not prev.fired and prev.sign == sign and ev.ts - prev.ts < ARM_MS:
+            # Продолжение того же импульса: обновляем размер, но не перевзводим.
+            prev.move_pct = (st.last_price / prev.start_price - 1) * 100.0
+            return
+        self.arms[ev.symbol] = _Arm(ev.ts, sign, float(d.get("move_pct", 0.0)), start_price,
+                                    abs(r60) if r60 is not None else 0.0,
+                                    st.oi_ring.value_at(ev.ts - win * 1000),
+                                    st.spread_median_before(ev.ts, 30))
+
+    def evaluate(self, st: SymbolState, now: int, delta60: tuple[float, float],
+                 spread_now: float | None, liq_usd: float | None = None) -> list[DetectorEvent]:
+        a = self.arms.get(st.symbol)
+        if a is None:
+            return []
+        if a.fired or now - a.ts > ARM_MS:
+            if now - a.ts > ARM_MS:
+                del self.arms[st.symbol]
+            return []
+        p = st.last_price
+        if p <= 0:
+            return []
+        # Экстремум импульса и пик скорости
+        if (a.sign < 0 and p < a.extreme) or (a.sign > 0 and p > a.extreme):
+            a.extreme = p
+        r60 = st.log_return(60, now)
+        if r60 is None:
+            return []
+        if r60 * a.sign > 0:
+            a.peak_r60 = max(a.peak_r60, abs(r60))
+        if now - a.ts < MIN_DELAY_MS:
+            return []
+        if abs(r60) >= 0.25 * a.peak_r60:
+            return []
+        buy, sell = delta60
+        total = buy + sell
+        if total < MIN_DELTA_TOTAL_USD:
+            return []
+        opposite = buy if a.sign < 0 else sell
+        share = opposite / total
+        if share < 0.55:
+            return []
+        if spread_now is None:
+            return []
+        if a.spread_med is not None and a.spread_med > 0:
+            if spread_now > 2.0 * a.spread_med:
+                return []
+        elif self.s.MAX_SPREAD_PCT > 0 and spread_now > self.s.MAX_SPREAD_PCT:
+            return []
+        a.fired = True
+        move_total = a.extreme - a.start_price
+        retrace = (p - a.extreme) / -move_total * 100.0 if move_total else 0.0
+        oi_now = st.oi_ring.last()
+        oi_ch = ((oi_now[1] / a.oi_start - 1) * 100.0) if (oi_now and a.oi_start) else None
+        direction = LONG if a.sign < 0 else SHORT
+        strength = min(1.0, 0.4 + 0.6 * (share - 0.5) / 0.3)
+        details = {
+            "impulse_tag": a.tag,
+            "impulse_move_pct": round((a.extreme / a.start_price - 1) * 100.0, 2),
+            "minutes_since": round((now - a.ts) / 60000.0, 1),
+            "retrace_pct": round(max(0.0, retrace), 1),
+            "r60_pct": round((math.exp(r60) - 1) * 100.0, 3),
+            "peak_r60_pct": round((math.exp(a.peak_r60) - 1) * 100.0 * a.sign, 3),
+            "delta_share_pct": round(share * 100.0, 1),
+            "delta_total_usd": round(total, 2),
+            "spread_pct": round(spread_now, 4),
+            "spread_median_before_pct": round(a.spread_med, 4) if a.spread_med is not None else None,
+            "oi_change_during_pct": round(oi_ch, 2) if oi_ch is not None else None,
+            "liq_usd": round(liq_usd, 2) if liq_usd else None,
+            "price": p,
+        }
+        return [DetectorEvent(st.symbol, EXHAUSTION, direction, round(strength, 3), now, details)]
+
+    def forget(self, symbol: str) -> None:
+        self.arms.pop(symbol, None)

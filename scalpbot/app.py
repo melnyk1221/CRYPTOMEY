@@ -182,6 +182,16 @@ class App:
     async def cmd_top(self, args: list[str]) -> str:
         return self.engine.top_text() if self.engine else "Движок ещё не запущен."
 
+    async def cmd_watch(self, args: list[str]) -> str:
+        if not args:
+            return "Использование: /watch SYMBOL (например AGT, AGTUSDT или AGT_USDT)"
+        return self.engine.watch(args[0]) if self.engine else "Движок ещё не запущен."
+
+    async def cmd_unwatch(self, args: list[str]) -> str:
+        if not args:
+            return "Использование: /unwatch SYMBOL"
+        return self.engine.unwatch(args[0]) if self.engine else "Движок ещё не запущен."
+
     async def cmd_export(self, args: list[str]) -> str | None:
         from .tracking.report import export_csv
         days = 7.0

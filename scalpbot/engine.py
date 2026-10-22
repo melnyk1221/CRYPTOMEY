@@ -12,10 +12,14 @@ from zoneinfo import ZoneInfo
 from .alerts import formatter as fmt
 from .bus import (DENSITY, EXHAUSTION, IMPULSE, LONG, PUSH, ROBOT, SHORT, SQUEEZE, DetectorEvent, DropQueue,
                   MarketMsg)
-from .detectors.impulse import ImpulseDetector
+from .detectors.absorption import AbsorptionDetector
+from .detectors.density import DensityDetector
+from .detectors.impulse import ExhaustionDetector, ImpulseDetector
+from .detectors.robot import RobotDetector
 from .market.clock import clock
 from .market.tier1 import Tier1
-from .market.universe import Universe
+from .market.tier2 import Tier2Manager, Tier2State
+from .market.universe import Universe, normalize_symbol
 from .probes import SOURCES, mode_of, run_probes
 from .scoring import L_EXHAUSTION, L_IMPULSE, L_SETUP, L_STRONG, AlertDecision, AlertGate, Scorer
 from .sources.common import SourceError, make_session
@@ -44,6 +48,13 @@ class Engine:
         self.universe = Universe()
         self.tier1 = Tier1(self.universe)
         self.impulse = ImpulseDetector(self.s, self.tier1)
+        self.exhaustion = ExhaustionDetector(self.s)
+        self.absorption = AbsorptionDetector(self.s)
+        self.tier2 = Tier2Manager(self.s, self._t2_subscribe, self._t2_unsubscribe,
+                                  on_demoted=self._t2_demoted)
+        self.t2_queue: DropQueue[MarketMsg] = DropQueue(20000, "tier2")
+        self.t2_conns: list[MexcWs] = []
+        self.detector_errors = 0
         self.scorer = Scorer(self.s)
         self.gate = AlertGate(self.s)
         self.tracker = Tracker(self.db)
@@ -69,6 +80,7 @@ class Engine:
         await self.run_startup_probes()
         await self.load_universe_with_retry()
         await self.verify_depth_index()
+        self.tier2.vol_idx = self.depth_vol_index
         # Трекеры и кулдауны из SQLite
         now = clock.now()
         restored = self.tracker.restore(await self.db.load_open_outcomes(), now)
@@ -88,6 +100,9 @@ class Engine:
         sp("daily_report", self.daily_report_loop)
         sp("maintenance", self.maintenance_loop)
         sp("digest", self.digest_loop)
+        sp("process_tier2", self.t2_process_loop)
+        sp("book_sync", self.book_sync_loop)
+        sp("tier2_eval", self.tier2_eval_loop)
         self.started = True
 
     async def stop(self) -> None:
@@ -148,6 +163,9 @@ class Engine:
 
     def on_symbol_removed(self, symbol: str) -> None:
         self.scorer.forget(symbol)
+        self.exhaustion.forget(symbol)
+        if symbol in self.tier2:
+            self.tier2.demote(symbol, clock.now(), why="контракт выключен")
 
     async def verify_depth_index(self) -> None:
         """VERIFY: индекс 1 в уровнях стакана = объём в контрактах. Проверяем по BTC_USDT."""
@@ -218,7 +236,10 @@ class Engine:
         self.after_tier1_frame(ts)
 
     def after_tier1_frame(self, ts: int) -> None:
-        """Точка расширения (tier 2)."""
+        # Промоушен по предтриггеру импульса (≥ 0.6 порога).
+        for sym in self.impulse.pretriggered:
+            if sym not in self.tier2:
+                self.promote(sym, "предимпульс", ts)
 
     def on_contract_push(self, data) -> None:
         items = data if isinstance(data, list) else [data]
@@ -239,6 +260,9 @@ class Engine:
     # События и алерты
     # ======================================================================
     def mid_and_spread(self, symbol: str) -> tuple[float | None, float | None]:
+        t2 = self.tier2.get(symbol)
+        if t2 and t2.book.synced and t2.book.mid > 0:
+            return t2.book.mid, t2.book.spread_pct
         st = self.tier1.get(symbol)
         if not st:
             return None, None
@@ -261,7 +285,12 @@ class Engine:
             self.handle_decision(dec)
 
     def on_event_hook(self, ev: DetectorEvent) -> None:
-        """Точка расширения: промоушен в tier 2, взвод детектора затухания и т.п."""
+        self.tier2.touch(ev.symbol, ev.ts)
+        if ev.family == IMPULSE:
+            st = self.tier1.get(ev.symbol)
+            if st:
+                self.exhaustion.arm(ev, st)
+            self.promote(ev.symbol, "impulse", ev.ts, force=True)
 
     def handle_decision(self, dec: AlertDecision) -> None:
         now = dec.ts
@@ -388,7 +417,21 @@ class Engine:
             await asyncio.sleep(15)
 
     def after_rest_tickers(self) -> None:
-        """Точка расширения (промоушен по OI/фандингу)."""
+        """Промоушен по скачку OI и экстремальному фандингу — не больше половины мест tier 2."""
+        now = clock.now()
+        cands: list[tuple[float, str, str]] = []
+        for st in self.tier1.eligible(self.s.MIN_TURNOVER_24H_USD):
+            if st.symbol in self.tier2:
+                continue
+            oi = st.oi_change_pct(900)
+            if oi is not None and oi >= self.s.OI_JUMP_PCT:
+                cands.append((oi / self.s.OI_JUMP_PCT, st.symbol, f"OI +{oi:.0f}%/15м"))
+            elif abs(st.funding_rate * 100) >= self.s.FUNDING_EXTREME:
+                cands.append((abs(st.funding_rate * 100) / self.s.FUNDING_EXTREME, st.symbol,
+                              f"funding {st.funding_rate * 100:+.3f}%"))
+        budget = self.tier2.capacity // 2 - self.tier2.count_reason("OI") - self.tier2.count_reason("funding")
+        for _, sym, reason in sorted(cands, reverse=True)[:max(0, budget)]:
+            self.promote(sym, reason, now)
 
     async def universe_refresh_loop(self) -> None:
         last = time.monotonic()
@@ -492,6 +535,178 @@ class Engine:
                 self.app.notify(text)
 
     # ======================================================================
+    # Tier 2
+    # ======================================================================
+    def promote(self, symbol: str, reason: str, now: int, manual: bool = False, force: bool = False) -> Tier2State | None:
+        spec = self.universe.get(symbol)
+        if spec is None:
+            return None
+        st = self.tier2.promote(spec, reason, now, manual=manual, force=force)
+        if st is not None and not st.det:
+            st.det["density"] = DensityDetector(self.s)
+            st.det["robot"] = RobotDetector(self.s)
+            self.on_promoted_hook(st)
+        return st
+
+    def on_promoted_hook(self, st: Tier2State) -> None:
+        """Точка расширения: спот, DexScreener, ликвидации (фазы 3–4)."""
+
+    def _conn(self, idx: int) -> MexcWs:
+        while len(self.t2_conns) <= idx:
+            i = len(self.t2_conns)
+            ws = MexcWs(self.session, f"tier2-{i}", self.t2_queue,
+                        self.health.source("mexc_futures_ws", SOURCES["mexc_futures_ws"]))
+
+            async def on_connect(i: int = i) -> None:
+                for st in self.tier2.states.values():
+                    if st.conn_idx == i:
+                        st.book.invalidate()
+
+            ws.on_connect = on_connect
+            self.t2_conns.append(ws)
+            self.app.spawn(f"ws_tier2_{i}", ws.run)
+        return self.t2_conns[idx]
+
+    def _t2_subscribe(self, idx: int, symbol: str) -> None:
+        ws = self._conn(idx)
+
+        async def go() -> None:
+            await ws.subscribe("sub.deal", {"symbol": symbol, "compress": False})
+            await ws.subscribe("sub.depth", {"symbol": symbol})
+        asyncio.get_running_loop().create_task(go())
+
+    def _t2_unsubscribe(self, idx: int, symbol: str) -> None:
+        if not (0 <= idx < len(self.t2_conns)):
+            return
+        ws = self.t2_conns[idx]
+
+        async def go() -> None:
+            await ws.unsubscribe("sub.deal", {"symbol": symbol})
+            await ws.unsubscribe("sub.depth", {"symbol": symbol})
+        asyncio.get_running_loop().create_task(go())
+
+    def _t2_demoted(self, symbol: str) -> None:
+        self.exhaustion.forget(symbol)
+        self.on_demoted_hook(symbol)
+
+    def on_demoted_hook(self, symbol: str) -> None:
+        """Точка расширения (фазы 3–4)."""
+
+    async def t2_process_loop(self) -> None:
+        q = self.t2_queue
+        states = self.tier2.states
+        while True:
+            m = await q.get()
+            try:
+                clock.update(m.ts)
+                st = states.get(m.symbol or "")
+                if st is None:
+                    continue
+                if m.channel == "push.deal":
+                    items = m.data if isinstance(m.data, list) else [m.data]
+                    for it in items:
+                        st.trades.add_fill(it)
+                elif m.channel == "push.depth":
+                    if st.book.on_update(m.data) == "resync":
+                        self.health.inc("book_resync_requests")
+            except Exception:
+                log.exception("Ошибка обработки tier 2", extra={"channel": m.channel, "symbol": m.symbol})
+            if len(q) > 200:
+                await asyncio.sleep(0)
+
+    async def book_sync_loop(self) -> None:
+        """Снапшоты стаканов: после промоушена/переподключения, при разрыве версий и раз в 10 минут."""
+        assert self.rest
+        while True:
+            await asyncio.sleep(0.25)
+            for st in list(self.tier2.states.values()):
+                book = st.book
+                try:
+                    if book.needs_resync and book.synced:
+                        commits = await self.rest.depth_commits(st.symbol, 1000)
+                        if st.symbol not in self.tier2:
+                            continue
+                        if book.apply_commits(commits):
+                            self.health.inc("book_resync_ok")
+                        else:
+                            book.needs_snapshot = True
+                            self.health.inc("book_resync_failed")
+                    if book.due_resnapshot():
+                        snap = await self.rest.depth(st.symbol, 1000)
+                        if st.symbol in self.tier2:
+                            book.apply_snapshot(snap)
+                except SourceError as e:
+                    log.warning("Стакан: ошибка REST", extra={"symbol": st.symbol, "err": str(e)})
+                    await asyncio.sleep(1)
+
+    async def tier2_eval_loop(self) -> None:
+        last_top = 0.0
+        last_idle = 0.0
+        while True:
+            await asyncio.sleep(1.0)
+            now = clock.now()
+            for st in list(self.tier2.states.values()):
+                try:
+                    for ev in self.eval_tier2_symbol(st, now):
+                        self.handle_event(ev)
+                except Exception:
+                    self.detector_errors += 1
+                    log.exception("Ошибка детектора", extra={"symbol": st.symbol})
+            mono = time.monotonic()
+            if mono - last_top >= 60:
+                last_top = mono
+                for t1, _ in self.tier1.top_movers(self.s.MIN_TURNOVER_24H_USD, 900, 5):
+                    if t1.symbol not in self.tier2:
+                        self.promote(t1.symbol, "топ-5 за 15м", now)
+            if mono - last_idle >= 30:
+                last_idle = mono
+                self.tier2.demote_idle(now)
+
+    def eval_tier2_symbol(self, st: Tier2State, now: int) -> list[DetectorEvent]:
+        t1 = self.tier1.get(st.symbol)
+        amount24 = t1.amount24 if t1 else 0.0
+        st.trades.flush(now)
+        book = st.book
+        events: list[DetectorEvent] = []
+        if book.synced:
+            book.prune(self.s.BOOK_KEEP_PCT)
+            dens: DensityDetector = st.det["density"]
+            events += dens.evaluate(st.symbol, book, st.trades, now, amount24)
+            px = st.trades.last_price or (t1.last_price if t1 else 0.0)
+            events += self.absorption.evaluate(st.symbol, dens, px, now)
+        robot: RobotDetector = st.det["robot"]
+        events += robot.evaluate(st.symbol, st.trades.orders, now, amount24)
+        if t1:
+            spread = book.spread_pct if book.synced else t1.spread_pct
+            events += self.exhaustion.evaluate(t1, now, st.trades.delta(now, 60), spread, self.liq_usd(st, now))
+        events += self.eval_tier2_extra(st, now)
+        return events
+
+    def eval_tier2_extra(self, st: Tier2State, now: int) -> list[DetectorEvent]:
+        """Точка расширения (толкание, сквиз)."""
+        return []
+
+    def liq_usd(self, st: Tier2State, now: int) -> float | None:
+        return None
+
+    def watch(self, raw: str) -> str:
+        sym = normalize_symbol(raw)
+        if sym not in self.universe:
+            return f"Контракт {fmt.e(sym)} не найден среди активных USDT-перпетуалов MEXC."
+        st = self.promote(sym, "вручную /watch", clock.now(), manual=True)
+        if st is None:
+            return "Не удалось добавить в tier 2."
+        return (f"👁 {fmt.e(sym)} в tier 2 (стакан + сделки). Автоматически не будет удалён. "
+                f"/unwatch {fmt.e(sym)} — снять.")
+
+    def unwatch(self, raw: str) -> str:
+        sym = normalize_symbol(raw)
+        if sym not in self.tier2:
+            return f"{fmt.e(sym)} не в tier 2."
+        self.tier2.demote(sym, clock.now(), why="/unwatch")
+        return f"{fmt.e(sym)} снят с детального наблюдения."
+
+    # ======================================================================
     # Для команд
     # ======================================================================
     def top_text(self) -> str:
@@ -520,4 +735,8 @@ class Engine:
         ]
         if self.rest:
             lines.append(f"REST MEXC: {self.rest.base}, запросов {self.rest.requests}, ошибок {self.rest.errors}")
+        t2_msgs = sum(c.messages for c in self.t2_conns)
+        lines.append(f"Tier 2: {len(self.tier2)}/{self.tier2.capacity} · WS-соединений {len(self.t2_conns)} · "
+                     f"сообщений {t2_msgs} · потеряно {self.t2_queue.dropped} · ошибок детекторов {self.detector_errors}")
+        lines.extend(self.tier2.describe(clock.now()))
         return lines
