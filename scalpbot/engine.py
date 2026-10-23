@@ -85,7 +85,8 @@ class Engine:
     # Запуск
     # ======================================================================
     async def start(self) -> None:
-        self.session = make_session()
+        self.session = self.app.session or make_session()
+        self._own_session = self.app.session is None
         st = self.health.source("mexc_futures", SOURCES["mexc_futures"])
         self.rest = MexcFuturesRest(self.session, self.s.MEXC_FUTURES_REST_BASE, st)
         await self.run_startup_probes()
@@ -126,7 +127,7 @@ class Engine:
             self.tier2.max_override = None
 
     async def stop(self) -> None:
-        if self.session:
+        if self.session and getattr(self, "_own_session", False):
             await self.session.close()
 
     async def run_startup_probes(self) -> None:

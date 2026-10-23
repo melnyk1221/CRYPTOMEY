@@ -49,15 +49,17 @@ class OutMsg:
     filename: str = ""
     caption: str | None = None
     on_result: Callable[[bool], Any] | None = None
+    chat_id: int | None = None     # None → чат владельца
+    reply: bool = False            # ответ на команду: уходит в Telegram и при DRY_RUN
     created: float = field(default_factory=time.monotonic)
 
 
 class TelegramSender:
-    """Единственная точка выхода сообщений. В DRY_RUN печатает в stdout."""
+    """Единственная точка выхода сообщений. В DRY_RUN алерты печатаются в stdout."""
 
-    def __init__(self, bot: Any | None, chat_id: int | None, dry_run: bool,
+    def __init__(self, client: Any | None, chat_id: int | None, dry_run: bool,
                  min_interval: float = 1.1, max_retries: int = 5, queue_size: int = 300):
-        self.bot = bot
+        self.client = client
         self.chat_id = chat_id
         self.dry_run = dry_run
         self.max_retries = max_retries
@@ -70,10 +72,18 @@ class TelegramSender:
 
     @property
     def can_deliver(self) -> bool:
-        return self.dry_run or (self.bot is not None and self.chat_id is not None)
+        return self.dry_run or (self.client is not None and self.chat_id is not None)
+
+    def _deliverable(self, msg: OutMsg) -> bool:
+        if self.client is not None and (msg.chat_id or self.chat_id) is not None:
+            return True
+        return self.dry_run
+
+    def _to_stdout(self, msg: OutMsg) -> bool:
+        return self.dry_run and not (msg.reply and self.client is not None)
 
     def enqueue(self, msg: OutMsg) -> bool:
-        if not self.can_deliver:
+        if not self._deliverable(msg):
             log.info("Сообщение не отправлено: чат не настроен", extra={"text": (msg.text or msg.caption or "")[:200]})
             if msg.on_result:
                 msg.on_result(False)
@@ -88,8 +98,9 @@ class TelegramSender:
                 msg.on_result(False)
             return False
 
-    def send_text(self, text: str, on_result: Callable[[bool], Any] | None = None) -> bool:
-        return self.enqueue(OutMsg(text=truncate(text), on_result=on_result))
+    def send_text(self, text: str, on_result: Callable[[bool], Any] | None = None,
+                  chat_id: int | None = None, reply: bool = False) -> bool:
+        return self.enqueue(OutMsg(text=truncate(text), on_result=on_result, chat_id=chat_id, reply=reply))
 
     def send_document(self, data: bytes, filename: str, caption: str | None = None) -> bool:
         return self.enqueue(OutMsg(document=data, filename=filename,
@@ -98,6 +109,9 @@ class TelegramSender:
     async def run(self) -> None:
         while True:
             msg = await self.queue.get()
+            # 409: бота опрашивает другой экземпляр — ничего не шлём, пока конфликт не устранён.
+            while self.client is not None and getattr(self.client, "conflict", False) and not self._to_stdout(msg):
+                await self.sleep(1.0)
             await self.bucket.acquire()
             ok = await self.deliver(msg)
             if msg.on_result:
@@ -107,7 +121,7 @@ class TelegramSender:
                     log.exception("Ошибка в on_result")
 
     async def deliver(self, msg: OutMsg) -> bool:
-        if self.dry_run:
+        if self._to_stdout(msg):
             if msg.text is not None:
                 print(f"\n----- [DRY_RUN] Telegram -----\n{msg.text}\n------------------------------", flush=True)
             else:
@@ -115,33 +129,35 @@ class TelegramSender:
                       f"{msg.caption or ''}", flush=True)
             self.sent += 1
             return True
-        from aiogram.exceptions import (TelegramBadRequest, TelegramForbiddenError,
-                                        TelegramNetworkError, TelegramRetryAfter, TelegramServerError)
-        from aiogram.types import BufferedInputFile
+        from ..bot.telegram_client import TgBadRequest, TgForbidden, TgNetworkError, TgRetryAfter
 
+        chat_id = msg.chat_id or self.chat_id
         attempt = 0
         while True:
             try:
                 if msg.text is not None:
-                    await self.bot.send_message(self.chat_id, msg.text)
+                    await self.client.send_message(chat_id, msg.text)
                 else:
-                    await self.bot.send_document(self.chat_id, BufferedInputFile(msg.document or b"", msg.filename),
-                                                 caption=msg.caption)
+                    await self.client.send_document(chat_id, msg.document or b"", msg.filename, msg.caption)
                 self.sent += 1
                 return True
-            except TelegramRetryAfter as e:
+            except TgRetryAfter as e:
                 log.warning("Telegram 429, ждём", extra={"retry_after": e.retry_after})
                 await self.sleep(float(e.retry_after) + 0.5)
-            except (TelegramNetworkError, TelegramServerError, asyncio.TimeoutError, OSError) as e:
+            except (TgNetworkError, asyncio.TimeoutError, OSError) as e:
                 attempt += 1
                 if attempt > self.max_retries:
                     self.failed += 1
                     log.error("Telegram: сообщение не доставлено после повторов", extra={"err": str(e)})
                     return False
                 await self.sleep(min(30.0, 2.0 ** attempt))
-            except (TelegramBadRequest, TelegramForbiddenError) as e:
+            except (TgBadRequest, TgForbidden) as e:
                 self.failed += 1
                 log.error("Telegram отклонил сообщение", extra={"err": str(e)})
+                return False
+            except Exception as e:  # noqa: BLE001 — в т.ч. TgConflict при отправке: не роняем очередь
+                self.failed += 1
+                log.error("Telegram: неожиданная ошибка отправки", extra={"err": str(e)[:200]})
                 return False
 
     async def send_now(self, text: str, timeout: float = 5.0) -> bool:

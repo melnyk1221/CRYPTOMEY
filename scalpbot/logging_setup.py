@@ -83,5 +83,5 @@ def setup_logging(level: str = "INFO") -> None:
     root.addHandler(handler)
     root.setLevel(getattr(logging, level.upper(), logging.INFO))
     # Сторонние библиотеки слишком болтливы на INFO.
-    for noisy in ("aiogram", "aiohttp", "aiosqlite", "asyncio"):
+    for noisy in ("aiohttp", "aiosqlite", "asyncio"):
         logging.getLogger(noisy).setLevel(logging.WARNING)

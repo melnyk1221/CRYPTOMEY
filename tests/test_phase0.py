@@ -127,25 +127,26 @@ async def test_sender_dry_run_and_min_interval(capsys):
 
 
 async def test_sender_handles_retry_after_and_network():
-    from aiogram.exceptions import TelegramNetworkError, TelegramRetryAfter
-    from aiogram.methods import SendMessage
+    from scalpbot.bot.telegram_client import TgNetworkError, TgRetryAfter
 
     calls = []
 
-    class Bot:
+    class Client:
+        conflict = False
+
         async def send_message(self, chat_id, text):
             calls.append(text)
             if len(calls) == 1:
-                raise TelegramRetryAfter(method=SendMessage(chat_id=1, text="x"), message="flood", retry_after=3)
+                raise TgRetryAfter("flood", 3)
             if len(calls) == 2:
-                raise TelegramNetworkError(method=SendMessage(chat_id=1, text="x"), message="net")
+                raise TgNetworkError("net")
 
     slept = []
 
     async def fake_sleep(d):
         slept.append(d)
 
-    s = TelegramSender(Bot(), 1, dry_run=False)
+    s = TelegramSender(Client(), 1, dry_run=False)
     s.sleep = fake_sleep
     assert await s.deliver(OutMsg(text="hi")) is True
     assert len(calls) == 3 and slept[0] >= 3

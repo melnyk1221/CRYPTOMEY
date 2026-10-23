@@ -29,8 +29,10 @@ class App:
         self.settings = settings
         self.health = Health(memory_limit_mb=settings.MEMORY_LIMIT_MB)
         self.db = Database(settings.DATA_DIR)
-        self.bot = None
-        self.dp = None
+        self.session = None
+        self.tg = None          # TelegramClient
+        self.poller = None      # UpdatePoller
+        self.router = None      # CommandRouter
         self.sender: TelegramSender | None = None
         self.engine = None
         self.paused = False
@@ -77,24 +79,25 @@ class App:
         self.digest_enabled = flags.get("flag:digest", "1") == "1"
         self.paused = flags.get("flag:paused", "0") == "1"
 
+        from .sources.common import make_session
+        self.session = make_session()
         if s.TELEGRAM_BOT_TOKEN:
-            from aiogram import Bot, Dispatcher
-            from aiogram.client.default import DefaultBotProperties
-
-            from .bot.handlers import build_router
-            self.bot = Bot(s.TELEGRAM_BOT_TOKEN,
-                           default=DefaultBotProperties(parse_mode="HTML", link_preview_is_disabled=True))
-            self.dp = Dispatcher()
-            self.dp.include_router(build_router(self))
-        self.sender = TelegramSender(self.bot, s.TELEGRAM_CHAT_ID, s.DRY_RUN)
+            from .bot.handlers import CommandRouter
+            from .bot.telegram_client import TelegramClient, UpdatePoller
+            self.tg = TelegramClient(self.session, s.TELEGRAM_BOT_TOKEN)
+            self.router = CommandRouter(self)
+            last = flags.get("tg:last_update_id")
+            self.poller = UpdatePoller(self.tg, self.router.handle, int(last) if last else None,
+                                       self._save_update_id)
+        self.sender = TelegramSender(self.tg, s.TELEGRAM_CHAT_ID, s.DRY_RUN)
         if s.setup_mode and not s.DRY_RUN:
             log.warning("TELEGRAM_CHAT_ID пуст — режим настройки: отправьте /start боту, алерты не отправляются")
 
         self.spawn("db_flush", self.db.flush_loop)
         self.spawn("tg_sender", self.sender.run)
         self.spawn("loop_lag", lambda: self.health.lag_monitor(self._on_lag))
-        if self.dp and self.bot:
-            self.spawn("tg_polling", self._polling)
+        if self.poller:
+            self.spawn("tg_polling", self.poller.run)
         if not self.db.writable:
             self.notify("⚠️ Данные не сохраняются: том не подключён или каталог DATA_DIR недоступен для записи.")
         await self.on_start()
@@ -104,10 +107,8 @@ class App:
         self.engine = Engine(self)
         await self.engine.start()
 
-    async def _polling(self) -> None:
-        assert self.dp and self.bot
-        await self.dp.start_polling(self.bot, handle_signals=False, close_bot_session=False,
-                                    allowed_updates=["message"])
+    async def _save_update_id(self, update_id: int) -> None:
+        await self.db.save_setting("tg:last_update_id", update_id)
 
     def _on_lag(self, p95: float) -> None:
         self.notify(f"⚠️ Высокая задержка event loop: p95 ≈ {p95:.0f} мс. Возможно, не хватает CPU.")
@@ -140,9 +141,9 @@ class App:
             await asyncio.wait_for(self.db.close(), timeout=max(0.5, 5.0 - (time.monotonic() - t0)))
         except Exception:
             log.exception("Ошибка закрытия БД")
-        if self.bot:
+        if self.session:
             try:
-                await self.bot.session.close()
+                await self.session.close()
             except Exception:
                 pass
         log.info("Остановлено")
@@ -176,9 +177,11 @@ class App:
             lines.append("Источники: " + ", ".join(st.short() for st in srcs))
         lines.extend(self.status_extra())
         if self.sender:
-            lines.append(f"Telegram: отправлено {self.sender.sent}, ошибок {self.sender.failed}, "
-                         f"в очереди {self.sender.queue.qsize()}")
-        lines.append("💰 Railway: ≈$10 за ГБ RAM в месяц + CPU; держим RSS ≈300 МБ.")
+            tg = f"Telegram: отправлено {self.sender.sent}, ошибок {self.sender.failed}, "                  f"в очереди {self.sender.queue.qsize()}"
+            if self.tg and self.tg.conflict:
+                tg += " · ⚠️ 409: бота опрашивает другой экземпляр"
+            lines.append(tg)
+        lines.append("💰 Railway: ≈$10 за ГБ RAM в месяц + CPU; обычный RSS ≈80–100 МБ (≈$1 в месяц за память).")
         return "\n".join(lines)
 
     def status_extra(self) -> list[str]:

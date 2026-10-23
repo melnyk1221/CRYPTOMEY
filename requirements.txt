@@ -1,6 +1,5 @@
 aiohttp==3.14.5
 orjson==3.13.0
-aiogram==3.31.0
 aiosqlite==0.22.1
 tzdata==2026.5
 uvloop==0.22.1; sys_platform == "linux"

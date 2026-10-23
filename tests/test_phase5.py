@@ -5,7 +5,7 @@ import pytest
 
 from helpers import Feed, make_settings, make_universe
 from scalpbot.app import App
-from scalpbot.bot.handlers import OwnerOnly
+from scalpbot.bot.handlers import CommandRouter, parse_command
 from scalpbot.engine import Engine
 from scalpbot.market.tier1 import Tier1
 
@@ -81,39 +81,39 @@ async def test_memory_watchdog_actions(tmp_path):
 
 
 # ---------- безопасность: только владелец ----------
-async def test_owner_only_middleware_ignores_strangers():
-    mw = OwnerOnly(42)
-    called = []
-
-    async def handler(event, data):
-        called.append(event.chat.id)
-        return "ok"
-
-    stranger = types.SimpleNamespace(chat=types.SimpleNamespace(id=7), text="/status")
-    owner = types.SimpleNamespace(chat=types.SimpleNamespace(id=42), text="/status")
-    assert await mw(handler, stranger, {}) is None
-    assert await mw(handler, owner, {}) == "ok"
-    assert called == [42]
+def _msg(chat_id, text):
+    return {"message_id": 1, "chat": {"id": chat_id, "type": "private"}, "text": text}
 
 
-async def test_setup_mode_replies_chat_id_only_to_start():
-    mw = OwnerOnly(None)
-    answers = []
+async def test_owner_filter_ignores_strangers(tmp_path):
+    app = await _make(tmp_path)
+    r = CommandRouter(app)
+    await r.handle(_msg(7, "/status"))
+    await r.handle(_msg(7, "/pause"))
+    assert app.sender.queue.qsize() == 0 and app.paused is False and r.ignored == 2
+    await r.handle(_msg(42, "/pause@MyScalpBot"))
+    assert app.paused is True and app.sender.queue.qsize() == 1
+    msg = app.sender.queue.get_nowait()
+    assert msg.chat_id == 42 and msg.reply and "приостановлена" in msg.text
+    await app.db.close()
 
-    class Msg:
-        def __init__(self, text):
-            self.chat = types.SimpleNamespace(id=555)
-            self.text = text
 
-        async def answer(self, text):
-            answers.append(text)
+async def test_setup_mode_replies_chat_id_only_to_start(tmp_path):
+    app = await _make(tmp_path, TELEGRAM_CHAT_ID="")
+    r = CommandRouter(app)
+    await r.handle(_msg(555, "/start"))
+    await r.handle(_msg(555, "/status"))
+    await r.handle(_msg(555, "привет"))
+    assert app.sender.queue.qsize() == 1
+    m = app.sender.queue.get_nowait()
+    assert m.chat_id == 555 and "555" in m.text and "TELEGRAM_CHAT_ID" in m.text
+    await app.db.close()
 
-    async def handler(event, data):
-        raise AssertionError("в режиме настройки команды не выполняются")
 
-    await mw(handler, Msg("/start"), {})
-    await mw(handler, Msg("/status"), {})
-    assert len(answers) == 1 and "555" in answers[0] and "TELEGRAM_CHAT_ID" in answers[0]
+def test_parse_command():
+    assert parse_command("/watch@Bot AGT") == ("watch", ["AGT"])
+    assert parse_command("/STATS 7 strong") == ("stats", ["7", "strong"])
+    assert parse_command("hello") is None and parse_command("/") is None
 
 
 # ---------- сквозной сценарий: импульс → алерт → запись → трекер ----------

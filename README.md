@@ -165,8 +165,8 @@ OI 15м: +12.4% · funding +0.010% / 8ч
 3. **Том.** *Service → Volumes → Add Volume*, mount path `/data`. Задайте `DATA_DIR=/data` (или оставьте пустым — тогда используется `RAILWAY_VOLUME_MOUNT_PATH`). Если на томе ошибки прав, добавьте переменную `RAILWAY_RUN_UID=0` (контейнер и так работает от root).
 4. **Telegram.** Создайте бота у @BotFather и задайте `TELEGRAM_BOT_TOKEN`. `TELEGRAM_CHAT_ID` **оставьте пустым** → Deploy → отправьте боту `/start`. Он ответит вашим chat id. Впишите его в `TELEGRAM_CHAT_ID` → Redeploy.
 5. **Первый запуск с `DRY_RUN=1`.** Смотрите логи (*Deployments → View logs*): таблицу проверки источников, строку `VERIFY стакан…`, RSS. Можно разово запустить `python -m scalpbot.smoke --seconds 120` (Railway → *Service → Settings → Custom Start Command* или локально). Потом поставьте `DRY_RUN=0`.
-6. **Порт и healthcheck не нужны** — это фоновый воркер (long polling Telegram).
-7. **Память.** *Service → Metrics → Memory*. Обычный уровень — 80–150 МБ; бот рассчитан на ≤ 350 МБ. При > 80% лимита (`MEMORY_LIMIT_MB=450`) он сам урезает tier 2 и пишет об этом в Telegram.
+6. **Порт и healthcheck не нужны** — это фоновый воркер (long polling Telegram). Запускайте **один** экземпляр: если тот же токен опрашивает второй процесс, Telegram отвечает 409 — бот пишет ошибку в лог, перестаёт отправлять сообщения и ждёт, пока конфликт исчезнет.
+7. **Память.** *Service → Metrics → Memory*. Обычный уровень — 80–100 МБ (замер: простой ≈87 МБ, 15 символов в tier 2 — пик ≈92 МБ); бот рассчитан на ≤ 350 МБ. При > 80% лимита (`MEMORY_LIMIT_MB=450`) он сам урезает tier 2 и пишет об этом в Telegram.
 
 После каждого redeploy:
 - бот присылает «🛑 Бот остановлен», затем «Бот запущен. Источники: …»;
@@ -178,7 +178,7 @@ OI 15м: +12.4% · funding +0.010% / 8ч
 ## Стоимость (честно)
 
 - RAM ≈ **$10 за ГБ·месяц**, CPU ≈ **$20 за vCPU·месяц**, исходящий трафик $0.05/ГБ (бот почти ничего не отправляет).
-- Бот на ~100–300 МБ с низкой загрузкой CPU стоит примерно **$3–7 в месяц**.
+- Бот на ~100 МБ с низкой загрузкой CPU стоит примерно **$2–5 в месяц**.
 - **Free** ($1 кредита в месяц) не покроет работу 24/7. **Trial** (разово $5) хватит на несколько недель. Реалистичный вариант — **Hobby** ($5/месяц, включает $5 использования): обычно укладывается в него или чуть выше.
 - Экономия памяти напрямую экономит деньги: не поднимайте `TIER2_MAX` без нужды.
 
@@ -213,7 +213,7 @@ OI 15м: +12.4% · funding +0.010% / 8ч
 ```bash
 python -m venv .venv
 .venv/bin/pip install -r requirements-dev.txt
-.venv/bin/python -m pytest                       # 86 тестов на синтетике, без сети
+.venv/bin/python -m pytest                       # 100 тестов на синтетике и имитации Telegram API, без сети
 .venv/bin/python -m scalpbot.probe               # доступность источников (таблица)
 .venv/bin/python -m scalpbot.smoke --seconds 120 # живая проверка MEXC (VERIFY-пункты)
 DRY_RUN=1 .venv/bin/python -m scalpbot           # полный бот, алерты в stdout
@@ -229,6 +229,7 @@ DRY_RUN=1 .venv/bin/python -m scalpbot           # полный бот, алер
 - форматирование и HTML-экранирование;
 - сопоставление DexScreener, Bybit/Hyperliquid, rate limiters;
 - `/set`, сторож памяти, доступ только для владельца;
+- транспорт Telegram против имитации Bot API (aiohttp-сервер): offset long polling, 429 `retry_after`, повторы при 5xx, 409, multipart `sendDocument`, рестарт без повторной обработки команд;
 - сквозной сценарий;
 - тест памяти: 900 символов tier 1 и 15 tier 2 за 10 минут симуляции.
 
@@ -254,7 +255,8 @@ scalpbot/
   alerts/                  formatter (русский HTML), sender (≥1.1 с между сообщениями, 429)
   tracking/                tracker (форвард-доходности, MFE/MAE), report (/stats, отчёт, CSV)
   storage/db.py            SQLite WAL, миграции, пакетная запись, ретеншн 60 дней, VACUUM
-  bot/handlers.py          команды (aiogram 3, только владелец)
+  bot/telegram_client.py   свой клиент Bot API на aiohttp: getUpdates (long polling), sendMessage, sendDocument
+  bot/handlers.py          команды (только владелец, режим настройки)
 ```
 
 Принципы:
@@ -264,6 +266,7 @@ scalpbot/
 - WS-читатель никогда не блокируется.
 - Падение одного детектора не роняет процесс.
 - Плановое переподключение WS — каждые 12 ч.
+- Telegram — собственный минимальный клиент вместо aiogram: импорт aiogram стоил ≈130–160 МБ RSS, клиент на уже открытой aiohttp-сессии — ≈0. Последний обработанный `update_id` хранится в SQLite, поэтому после рестарта команды не выполняются повторно.
 
 ---
 
