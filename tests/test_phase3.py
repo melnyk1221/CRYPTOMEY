@@ -129,6 +129,20 @@ def test_dex_match_highest_liquidity_exact_symbol():
     assert p["baseToken"]["address"] == "best" and note == ""
 
 
+def test_dex_rejects_illiquid_pairs_even_if_price_matches():
+    pairs = [pair("UNITREE", 92.59, 16_151, chain="robinhood", mcap=15_421)]
+    p, note = match_pair(pairs, "UNITREE", 93.0)
+    assert p is None and "ликвидность" in note
+
+
+def test_squeeze_ignores_absurd_oi_to_mcap():
+    st = _state(funding=-0.0107)
+    m = squeeze_metrics(st, {"mcap": 15_421, "mcap_source": "mcap", "volume_h24": 3_492}, None)
+    assert m["oi_to_mcap"] is None and m["mcap_suspicious"] is True and m["oi_to_mcap_raw"] > 5
+    conds, _ = evaluate_conditions(m)
+    assert "oi_to_mcap" not in conds
+
+
 def test_dex_rejects_price_deviation():
     pairs = [pair("AGT", 0.050, 5e6), pair("AGT", 0.030, 1e6)]
     p, note = match_pair(pairs, "AGT", 0.040)

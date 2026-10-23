@@ -28,6 +28,9 @@ BASE = "https://api.dexscreener.com"
 MATCH_TTL_MS = 24 * 3600_000
 METRICS_TTL_MS = 5 * 60_000
 PRICE_TOL = 0.03
+# Пары с мизерной ликвидностью не принимаем: цена может совпасть случайно (живой пример — UNITREE
+# сопоставился с токеном на $16k ликвидности и капой $15k → OI/капа ≈ 266).
+MIN_PAIR_LIQUIDITY_USD = 50_000.0
 
 _MULT_RE = re.compile(r"^(1000000|100000|10000|1000)([A-Z].*)$")
 
@@ -68,6 +71,10 @@ def match_pair(pairs: list[dict], base: str, ref_price: float) -> tuple[dict | N
     exact.sort(key=lambda p: _f((p.get("liquidity") or {}).get("usd")) or 0.0, reverse=True)
     if ref_price <= 0:
         return None, "нет цены MEXC для проверки"
+    liquid = [p for p in exact if (_f((p.get("liquidity") or {}).get("usd")) or 0.0) >= MIN_PAIR_LIQUIDITY_USD]
+    if not liquid:
+        return None, f"у пар с этим тикером ликвидность < ${MIN_PAIR_LIQUIDITY_USD:,.0f}"
+    exact = liquid
     for i, p in enumerate(exact):
         px = _f(p.get("priceUsd"))
         if px and abs(px / ref_price - 1) <= PRICE_TOL:

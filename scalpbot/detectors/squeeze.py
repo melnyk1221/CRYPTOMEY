@@ -17,6 +17,7 @@ from ..bus import LONG, NEUTRAL, SHORT, SQUEEZE, DetectorEvent
 from ..market.tier1 import SymbolState
 
 OI_MCAP_MIN = 0.3
+OI_MCAP_SANE_MAX = 5.0   # выше — почти наверняка неверное сопоставление токена/капы, не используем
 FUT_SPOT_MIN = 10.0
 FUNDING_SHORTS_PAY_PCT = -0.05
 FUNDING_LONGS_HOT_PCT = 0.10
@@ -33,11 +34,15 @@ def squeeze_metrics(st: SymbolState, dex: dict | None, spot_quote_volume: float 
     dex_vol = (dex or {}).get("volume_h24") or 0.0
     spot_vol = spot_quote_volume or 0.0
     denom = spot_vol + dex_vol
+    oi_mcap = oi_usd / mcap if mcap else None
+    suspicious = oi_mcap is not None and oi_mcap > OI_MCAP_SANE_MAX
     return {
         "oi_usd": round(oi_usd, 2),
         "mcap": mcap,
         "mcap_source": (dex or {}).get("mcap_source"),
-        "oi_to_mcap": round(oi_usd / mcap, 4) if mcap else None,
+        "oi_to_mcap": None if (oi_mcap is None or suspicious) else round(oi_mcap, 4),
+        "oi_to_mcap_raw": round(oi_mcap, 4) if suspicious else None,
+        "mcap_suspicious": suspicious,
         "fut_turnover_24h": st.amount24,
         "spot_volume_24h": spot_vol if spot_quote_volume is not None else None,
         "dex_volume_24h": dex_vol if dex else None,
